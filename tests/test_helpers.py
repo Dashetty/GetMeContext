@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from utils.helpers import document_summary, format_transcript, upload_signature
+from utils.helpers import (
+    document_summary,
+    explain_api_error,
+    format_transcript,
+    upload_signature,
+)
 
 
 def test_upload_signature_is_order_independent():
@@ -39,3 +44,30 @@ def test_document_summary_pluralises_and_sums_pages():
 
     assert document_summary(one) == "1 document · 4 pages"
     assert document_summary(many) == "2 documents · 10 pages"
+
+
+def test_explain_api_error_detects_quota_errors():
+    message = explain_api_error(RuntimeError("429 RESOURCE_EXHAUSTED: quota exceeded"))
+
+    assert "quota" in message.lower()
+    assert "gemini-3.5-flash-lite" in message
+
+
+def test_explain_api_error_detects_invalid_keys():
+    message = explain_api_error(RuntimeError("API_KEY_INVALID: API key not valid"))
+
+    assert "API key" in message
+    assert "GOOGLE_API_KEY" in message
+
+
+def test_explain_api_error_detects_retired_models():
+    message = explain_api_error(RuntimeError("404 model not found"))
+
+    assert "gemini-3.5-flash-lite" in message
+    assert "gemini-4-hydrogen" in message
+
+
+def test_explain_api_error_falls_back_to_generic_message():
+    message = explain_api_error(ValueError("something unexpected"))
+
+    assert "request failed" in message

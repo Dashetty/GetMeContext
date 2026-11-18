@@ -55,7 +55,7 @@ flowchart LR
     H --> I
     E --> I
     I --> J[Numbered context + history]
-    J --> K[Gemini 2.5 Flash]
+    J --> K[Gemini 3.5 Flash-Lite]
     K --> L[Streamed answer + citations]
 ```
 
@@ -77,7 +77,7 @@ numbered sources.
 | UI | Streamlit | Fast to ship, native file upload, chat primitives, free hosting |
 | Orchestration | LangChain (LCEL-friendly) | Composable retrieval/generation pieces |
 | Embeddings | Gemini `gemini-embedding-001` | No extra vendor, strong multilingual retrieval |
-| LLM | Gemini `gemini-2.5-flash` | Fast, cheap, free-tier friendly, configurable |
+| LLM | Gemini `gemini-3.5-flash-lite` | Free-tier friendly, ~500 req/day, configurable |
 | Vector store | ChromaDB | Local persistence, zero infrastructure |
 | PDF parsing | pypdf | Page-level text extraction and metadata |
 | Quality | pytest + ruff + GitHub Actions | Regression safety and consistent style |
@@ -111,7 +111,7 @@ deployed. Environment variables take priority; defaults are sensible.
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `GOOGLE_API_KEY` | — | **Required.** Gemini API key |
-| `GOOGLE_LLM_MODEL` | `gemini-2.5-flash` | Chat model for answers |
+| `GOOGLE_LLM_MODEL` | `gemini-3.5-flash-lite` | Chat model for answers |
 | `GOOGLE_EMBEDDING_MODEL` | `models/gemini-embedding-001` | Embedding model |
 | `CHUNK_SIZE` | `1000` | Characters per chunk |
 | `CHUNK_OVERLAP` | `200` | Overlap between chunks |
@@ -120,6 +120,34 @@ deployed. Environment variables take priority; defaults are sensible.
 | `CHROMA_PERSIST_DIR` | `chroma_db` | Local vector store directory |
 | `CHROMA_COLLECTION` | `docquery_docs` | Chroma collection name |
 | `MAX_UPLOAD_MB` | `50` | Per-file upload limit |
+
+### Choosing a free model
+
+`gemini-2.5-flash` is deprecated. From **1 December 2026**, requests to it are
+routed to `gemini-3.5-flash-lite`, and new projects cannot select it. Current
+free-tier options:
+
+| Model | Free tier | Typical free quota* | Trade-off |
+|-------|-----------|---------------------|-----------|
+| `gemini-3.5-flash-lite` (default) | ✅ | ~500 req/day, 15 RPM | Google's official 2.5 Flash replacement; best quota |
+| `gemini-3.1-flash-lite` | ✅ | ~500 req/day | Older Lite model |
+| `gemini-3.8-flash` | ✅ | ~20 req/day, 5 RPM | Better answers, tiny free quota |
+| `gemini-4-hydrogen` | ✅ | Varies (Flash-class) | Newest free model, strongest answers |
+
+\*Google does not publish fixed free-tier limits. Check **AI Studio → Rate
+limits** for your own project; limits are per project (not per key) and reset at
+midnight Pacific. Set `GOOGLE_LLM_MODEL` to switch.
+
+Two free-tier caveats:
+
+- Google may use free-tier prompts and document text to improve its products.
+  **Do not upload confidential documents.**
+- A public demo can exhaust a daily quota. The app turns `429` responses into a
+  clear "quota exhausted" message rather than an opaque failure.
+
+The embedding model intentionally stays `gemini-embedding-001`: it is text-only,
+supports the `task_type` routing this pipeline uses, and avoids the re-embedding
+incompatibility of `gemini-embedding-2`.
 
 ## Deploy (free) on Streamlit Community Cloud
 
@@ -136,7 +164,7 @@ environment variables are absent.
    GOOGLE_API_KEY = "your_google_api_key_here"
 
    # Optional overrides
-   GOOGLE_LLM_MODEL = "gemini-2.5-flash"
+   GOOGLE_LLM_MODEL = "gemini-3.5-flash-lite"
    GOOGLE_EMBEDDING_MODEL = "models/gemini-embedding-001"
    ```
 
@@ -147,8 +175,11 @@ environment variables are absent.
 - Apps sleep after inactivity; the first visit afterwards takes a moment to wake.
 - The filesystem is ephemeral: the Chroma index is rebuilt when a new PDF set is
   uploaded or the app restarts. There is no user data to lose.
-- Free Gemini quotas are plenty for a demo, but a public app can exhaust them.
-  The UI reports quota/API errors explicitly.
+- Free Gemini quotas vary by model and project. The Flash-Lite default
+  (~500 requests/day) is sized for a public demo; the UI reports quota and API
+  errors explicitly.
+- Free-tier prompts and document text may be used to improve Google's products —
+  keep confidential PDFs out of the demo.
 
 ## Testing & quality
 
@@ -188,6 +219,10 @@ GetMeContext/
 - **One collection, rebuilt on upload.** Simpler than per-file collections and it
   guarantees retrieval never mixes chunks from a previous document set. The cost
   (re-embedding) is acceptable for resume-scale demos.
+- **Quota-aware model choice.** The default is the highest-quota free model
+  (`gemini-3.5-flash-lite`), not the newest one, because a public demo exhausts a
+  Flash model's ~20 requests/day almost immediately. Quality upgrades are one
+  environment variable away.
 - **Asymmetric embeddings.** Document chunks use Gemini's `retrieval_document`
   task type and queries use `retrieval_query`, which improves matching without a
   second model or index.

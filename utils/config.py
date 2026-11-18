@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 # Load .env once, at import time. Safe to call in every entry point.
 load_dotenv()
 
-DEFAULT_LLM_MODEL = "gemini-2.5-flash"
+DEFAULT_LLM_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_EMBEDDING_MODEL = "models/gemini-embedding-001"
 
 

@@ -10,7 +10,12 @@ from typing import Any, Mapping, Sequence
 import streamlit as st
 
 from utils.config import Settings, get_settings
-from utils.helpers import document_summary, format_transcript, upload_signature
+from utils.helpers import (
+    document_summary,
+    explain_api_error,
+    format_transcript,
+    upload_signature,
+)
 from utils.pdf_loader import PDFLoadError, load_pdf
 from utils.rag_chain import RAGPipeline, Source, create_rag_pipeline
 from utils.vector_store import build_vector_store, clear_vector_store
@@ -190,10 +195,7 @@ def answer_question(question: str, pipeline: RAGPipeline) -> None:
             render_sources(prepared.sources)
             sources = [asdict(source) for source in prepared.sources]
         except Exception as exc:  # noqa: BLE001 - show a friendly failure in the UI
-            answer = (
-                "Something went wrong while answering. Check that your Google API key "
-                "is valid and your quota is not exhausted, then try again."
-            )
+            answer = explain_api_error(exc)
             placeholder.error(answer)
             with st.expander("Error details"):
                 st.code(f"{type(exc).__name__}: {exc}")
@@ -312,6 +314,10 @@ def main() -> None:
         key="pdf_uploader",
         help=f"Up to {settings.max_upload_mb} MB per file.",
     )
+    st.caption(
+        "Free-tier keys may use submitted content to improve Google's products — "
+        "avoid uploading confidential documents."
+    )
 
     if not uploaded_files:
         if st.session_state.upload_signature is not None or st.session_state.index_error:
@@ -327,10 +333,11 @@ def main() -> None:
                     uploaded_files, settings.max_upload_mb
                 )
         except Exception as exc:  # noqa: BLE001 - surface any ingestion failure
+            message = str(exc) if isinstance(exc, PDFLoadError) else explain_api_error(exc)
             reset_index()
             st.session_state.upload_signature = signature
-            st.session_state.index_error = str(exc)
-            st.error(f"Could not index the uploads: {exc}")
+            st.session_state.index_error = message
+            st.error(f"Could not index the uploads: {message}")
             if st.button("Retry indexing"):
                 reset_index()
                 st.rerun()
