@@ -100,6 +100,9 @@ streamlit run app.py
 
 Open <http://localhost:8501>, upload a PDF, and ask a question.
 
+> On NTFS or network mounts where console scripts lose their executable bit, run
+> `python -m streamlit run app.py` instead.
+
 ## Configuration
 
 Every setting can be provided through `.env` locally or **Streamlit secrets** when
