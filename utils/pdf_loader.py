@@ -1,43 +1,68 @@
+"""PDF loading utilities.
+
+Uses pypdf directly (no deprecated community loader) and normalises metadata
+so every chunk can be traced back to the file and page it came from.
 """
-pdf_loader.py
-Handles PDF text extraction using PyPDF2.
-Provides a clean interface to load and extract text from uploaded PDF files.
-"""
+
+from __future__ import annotations
 
 from pathlib import Path
-from typing import List
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
+from pypdf import PdfReader
 
 
-def load_pdf(file_path: str | Path) -> List:
-    """
-    Load a PDF file and extract all text as LangChain Document objects.
+class PDFLoadError(ValueError):
+    """Raised when a PDF cannot be read or contains no extractable text."""
+
+
+def load_pdf(file_path: str | Path, display_name: str | None = None) -> list[Document]:
+    """Load a PDF and return one LangChain ``Document`` per page.
 
     Args:
-        file_path: Path to the PDF file (string or Path object)
+        file_path: Path to the PDF on disk.
+        display_name: Name shown in citations. Defaults to the file name.
 
     Returns:
-        List of Document objects, one per page, containing:
-            - page_content: Extracted text
-            - metadata: Page number, source file, etc.
+        Documents with ``metadata["source"]`` set to ``display_name`` and
+        ``metadata["page"]`` set to the zero-based page index.
 
     Raises:
-        FileNotFoundError: If PDF file does not exist
-        Exception: If PDF parsing fails (corrupted file, encrypted, etc.)
+        FileNotFoundError: If the file does not exist.
+        PDFLoadError: If parsing fails or no text can be extracted.
     """
-    # Convert to Path object for consistent handling
     path = Path(file_path)
-
-    # Validate file exists before attempting to load
     if not path.exists():
         raise FileNotFoundError(f"PDF file not found: {path}")
 
-    # Use LangChain's PyPDFLoader for robust text extraction
-    # It handles multi-page PDFs and returns metadata-rich Document objects
-    loader = PyPDFLoader(str(path))
+    name = display_name or path.name
 
-    # load() returns a list of Document objects (one per page)
-    documents = loader.load()
+    try:
+        reader = PdfReader(str(path))
+        if reader.is_encrypted:
+            # Many PDFs are encrypted with an empty owner password; try that
+            # first before giving up on the file.
+            try:
+                reader.decrypt("")
+            except Exception as exc:  # noqa: BLE001 - normalise to our error type
+                raise PDFLoadError(f"{name} is password-protected and cannot be read.") from exc
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except PDFLoadError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface a friendly, typed error
+        raise PDFLoadError(f"Could not read {name}: {exc}") from exc
+
+    if not pages:
+        raise PDFLoadError(f"{name} contains no readable pages.")
+
+    documents = [
+        Document(page_content=text, metadata={"source": name, "page": index})
+        for index, text in enumerate(pages)
+    ]
+
+    if not any(document.page_content.strip() for document in documents):
+        raise PDFLoadError(
+            f"{name} contains no extractable text. Scanned PDFs need OCR before upload."
+        )
 
     return documents

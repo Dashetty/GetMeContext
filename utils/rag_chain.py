@@ -1,133 +1,237 @@
-"""
-rag_chain.py
-Builds the RAG (Retrieval-Augmented Generation) pipeline.
-Connects retrieval (ChromaDB) with generation (Gemini LLM) using LangChain.
+"""Retrieval-Augmented Generation pipeline.
+
+Combines ChromaDB retrieval with Gemini generation:
+
+1. Condense follow-up questions into standalone search queries (chat memory).
+2. Retrieve the top-k most similar chunks.
+3. Build a prompt with numbered sources so answers can cite them.
+4. Stream the answer back to the UI.
 """
 
-import os
-from typing import List
+from __future__ import annotations
 
-from langchain_google_genai import ChatGoogleGenerativeAI
+from dataclasses import dataclass
+from typing import Any, Iterable, Iterator, List, Mapping, Sequence, Tuple
+
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
 
+from utils.config import Settings, get_settings
 
-# LLM Configuration
-LLM_MODEL = os.getenv("GOOGLE_LLM_MODEL", "gemini-1.5-flash")
-LLM_TEMPERATURE = 0.1            # Low temperature = more factual, less creative
+SYSTEM_PROMPT = """You are GetMeContext, a careful document analyst. Answer questions \
+using ONLY the numbered sources provided.
 
+Rules:
+- Use only the sources. Never use outside knowledge or make assumptions.
+- Cite the sources you rely on with bracketed numbers, e.g. [1] or [2][3].
+- If the answer is not in the sources, reply exactly:
+  "The answer is not available in the uploaded document."
+- Be concise but complete. Use bullet points for lists and steps.
+- Use the conversation history only to understand follow-up questions; \
+never treat it as a source of facts."""
 
-# Strict RAG prompt template
-# This ensures the model ONLY answers from provided context
-RAG_PROMPT_TEMPLATE = """You are a helpful assistant that answers questions STRICTLY based on the provided document context.
-
-INSTRUCTIONS:
-- Answer ONLY using the information from the context below
-- If the answer is not found in the context, respond EXACTLY: "The answer is not available in the uploaded document."
-- Do not use outside knowledge, make assumptions, or hallucinate information
-- Be concise but complete
-- If the context contains relevant information, cite the specific details
-
-DOCUMENT CONTEXT:
+ANSWER_TEMPLATE = """SOURCES:
 {context}
 
-USER QUESTION: {question}
+QUESTION: {question}"""
 
-ANSWER:"""
+CONDENSE_PROMPT = """Rewrite the follow-up question as a standalone search query for \
+document retrieval. Keep all specific names, numbers, and topics from the conversation. \
+Return only the rewritten question, with no explanation.
+
+Conversation:
+{history}
+
+Follow-up question: {question}
+
+Standalone question:"""
 
 
-def get_llm() -> ChatGoogleGenerativeAI:
-    """
-    Initialize the Gemini chat model.
+@dataclass(frozen=True)
+class Source:
+    """A citation the answer can reference, numbered to match the prompt."""
 
-    Returns:
-        Configured Gemini LLM instance
+    index: int
+    document: str
+    page: int  # 1-based; 0 means page unknown
+    snippet: str
 
-    Note:
-        Requires GOOGLE_API_KEY environment variable.
-        Uses gemini-1.5-flash for fast, affordable responses.
-    """
+
+@dataclass
+class PreparedAnswer:
+    """Everything needed to stream an answer and display its citations."""
+
+    messages: List[BaseMessage]
+    sources: List[Source]
+
+
+def get_llm(settings: Settings | None = None) -> ChatGoogleGenerativeAI:
+    """Initialise the Gemini chat model."""
+    settings = settings or get_settings()
     return ChatGoogleGenerativeAI(
-        model=LLM_MODEL,
-        temperature=LLM_TEMPERATURE,
-        convert_system_message_to_human=True  # Gemini doesn't support system messages directly
+        model=settings.llm_model,
+        temperature=settings.temperature,
+        max_retries=3,
     )
 
 
-def format_docs(docs: List[Document]) -> str:
+def message_text(message: Any) -> str:
+    """Extract plain text from an LLM response or streamed chunk.
+
+    Gemini can return either a string or a list of content blocks depending on
+    the SDK version, so normalise both shapes.
     """
-    Format a list of Document chunks into a single context string.
-
-    Each chunk is separated by a divider for clear separation.
-    Page metadata is included to help the LLM locate information.
-
-    Args:
-        docs: Retrieved document chunks from similarity search
-
-    Returns:
-        Formatted context string for the prompt
-    """
-    formatted = []
-    for i, doc in enumerate(docs, 1):
-        # Include page number if available in metadata
-        page_info = f"[Page {doc.metadata.get('page', 'N/A')}]"
-        formatted.append(f"--- Chunk {i} {page_info} ---\n{doc.page_content}")
-
-    return "\n\n".join(formatted)
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, Mapping):
+        return str(content.get("text", ""))
+    if isinstance(content, Sequence):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, Mapping):
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content or "")
 
 
-def create_rag_chain(retriever):
-    """
-    Build the complete RAG pipeline using LangChain's LCEL (LangChain Expression Language).
+def format_history(history: Sequence[Mapping[str, Any]], window: int) -> str:
+    """Render the last ``window`` turns as plain text for question condensing."""
+    if window <= 0 or not history:
+        return ""
+    turns = list(history)[-window * 2 :]
+    lines = []
+    for message in turns:
+        role = "User" if message.get("role") == "user" else "Assistant"
+        lines.append(f"{role}: {message.get('content', '')}")
+    return "\n".join(lines)
 
-    Pipeline flow:
-        1. User question → retriever fetches relevant chunks
-        2. Chunks are formatted into context string
-        3. Context + question are fed into the prompt template
-        4. Gemini LLM generates answer based ONLY on context
-        5. Output is parsed to clean string
 
-    Args:
-        retriever: A retriever object (e.g., vector_store.as_retriever())
+def to_chat_messages(
+    history: Sequence[Mapping[str, Any]], window: int
+) -> List[BaseMessage]:
+    """Convert session-state history dicts into LangChain chat messages."""
+    if window <= 0 or not history:
+        return []
+    messages: List[BaseMessage] = []
+    for message in list(history)[-window * 2 :]:
+        text = str(message.get("content", ""))
+        if message.get("role") == "user":
+            messages.append(HumanMessage(content=text))
+        else:
+            messages.append(AIMessage(content=text))
+    return messages
 
-    Returns:
-        Compiled RAG chain ready for invocation
-    """
-    # Initialize components
-    llm = get_llm()
-    prompt = PromptTemplate.from_template(RAG_PROMPT_TEMPLATE)
-    output_parser = StrOutputParser()
 
-    # Build the chain using LCEL pipe operator (|)
-    # This creates a clear, composable data flow
-    rag_chain = (
-        {
-            # "context": retrieve relevant docs and format them
-            "context": retriever | format_docs,
-            # "question": pass through the original question unchanged
-            "question": RunnablePassthrough()
-        }
-        | prompt           # Fill the template with context + question
-        | llm              # Send to Gemini for generation
-        | output_parser    # Extract clean string from LLM response
+def format_context(documents: Iterable[Document]) -> Tuple[str, List[Source]]:
+    """Build the numbered context block and the matching citation list."""
+    blocks: List[str] = []
+    sources: List[Source] = []
+
+    for index, document in enumerate(documents, start=1):
+        metadata = document.metadata or {}
+        name = str(metadata.get("source", "document"))
+        page = int(metadata.get("page", -1)) + 1
+        content = (document.page_content or "").strip()
+        snippet = " ".join(content.split())
+        if len(snippet) > 240:
+            snippet = snippet[:237].rstrip() + "..."
+
+        sources.append(Source(index=index, document=name, page=page, snippet=snippet))
+        blocks.append(f"[{index}] {name} — page {page}\n{content}")
+
+    return "\n\n".join(blocks), sources
+
+
+def build_messages(
+    context: str,
+    question: str,
+    history: Sequence[Mapping[str, Any]] = (),
+    window: int = 3,
+) -> List[BaseMessage]:
+    """Assemble the final chat messages sent to the LLM."""
+    return [
+        SystemMessage(content=SYSTEM_PROMPT),
+        *to_chat_messages(history, window),
+        HumanMessage(
+            content=ANSWER_TEMPLATE.format(context=context, question=question)
+        ),
+    ]
+
+
+class RAGPipeline:
+    """Stateful RAG pipeline bound to a retriever and an LLM."""
+
+    def __init__(self, retriever: Any, llm: Any, conversation_window: int = 3):
+        self.retriever = retriever
+        self.llm = llm
+        self.conversation_window = conversation_window
+
+    def standalone_question(
+        self, question: str, history: Sequence[Mapping[str, Any]]
+    ) -> str:
+        """Rewrite a follow-up question so retrieval does not depend on context."""
+        history_text = format_history(history, self.conversation_window)
+        if not history_text:
+            return question
+
+        prompt = CONDENSE_PROMPT.format(history=history_text, question=question)
+        try:
+            rewritten = message_text(self.llm.invoke(prompt)).strip()
+        except Exception:  # noqa: BLE001 - retrieval should still work without it
+            return question
+        return rewritten or question
+
+    def retrieve(
+        self, question: str, history: Sequence[Mapping[str, Any]]
+    ) -> List[Document]:
+        """Retrieve relevant chunks for a question, resolving follow-ups first."""
+        query = self.standalone_question(question, history)
+        return list(self.retriever.invoke(query))
+
+    def prepare(
+        self, question: str, history: Sequence[Mapping[str, Any]]
+    ) -> PreparedAnswer:
+        """Retrieve context and build the prompt, before any tokens are streamed."""
+        documents = self.retrieve(question, history)
+        context, sources = format_context(documents)
+        messages = build_messages(
+            context=context,
+            question=question,
+            history=history,
+            window=self.conversation_window,
+        )
+        return PreparedAnswer(messages=messages, sources=sources)
+
+    def stream(self, prepared: PreparedAnswer) -> Iterator[str]:
+        """Yield answer tokens as they arrive from Gemini."""
+        for chunk in self.llm.stream(prepared.messages):
+            text = message_text(chunk)
+            if text:
+                yield text
+
+    def answer(
+        self, question: str, history: Sequence[Mapping[str, Any]] = ()
+    ) -> Tuple[str, List[Source]]:
+        """Non-streaming convenience method used by tests and scripts."""
+        prepared = self.prepare(question, history)
+        return "".join(self.stream(prepared)), prepared.sources
+
+
+def create_rag_pipeline(
+    vector_store: Any, settings: Settings | None = None
+) -> RAGPipeline:
+    """Wire a Chroma vector store into a ready-to-use RAG pipeline."""
+    settings = settings or get_settings()
+    retriever = vector_store.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": settings.top_k},
     )
-
-    return rag_chain
-
-
-def answer_question(rag_chain, question: str) -> str:
-    """
-    Execute the RAG chain to answer a user question.
-
-    Args:
-        rag_chain: Compiled RAG pipeline
-        question: User's natural language question
-
-    Returns:
-        Generated answer string
-    """
-    # The chain handles retrieval, formatting, and generation automatically
-    response = rag_chain.invoke(question)
-    return response
+    return RAGPipeline(
+        retriever=retriever,
+        llm=get_llm(settings),
+        conversation_window=settings.conversation_window,
+    )

@@ -1,142 +1,102 @@
-"""
-vector_store.py
-Manages ChromaDB vector database operations.
-Handles embedding generation, storage, and similarity search for RAG retrieval.
+"""Vector store management.
+
+Pipeline: split documents into overlapping chunks → embed with Gemini →
+persist in ChromaDB. The app keeps a single collection that is rebuilt
+whenever the set of uploaded PDFs changes.
 """
 
-import os
+from __future__ import annotations
+
 import shutil
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Try multiple import paths for Chroma to handle different package versions
-try:
-    # Primary: langchain-chroma package (recommended for 2026)
-    from langchain_chroma import Chroma
-except ImportError:
-    try:
-        # Fallback: langchain_community vectorstores
-        from langchain_community.vectorstores import Chroma
-    except ImportError:
-        # Last resort: direct chromadb with LangChain wrapper
-        import chromadb
-        from chromadb.config import Settings
-
-        class Chroma:
-            """Minimal compatibility wrapper if langchain-chroma fails."""
-            pass
+from utils.config import Settings, get_settings
 
 
-# Configuration constants
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 200
-TOP_K_RESULTS = 5
-CHROMA_PERSIST_DIR = Path("chroma_db")
-
-
-def _select_embedding_model() -> str:
-    """Choose a supported embedding model name.
-
-    Priority:
-    1) Explicit env override
-    2) First available embedContent-capable model from API
-    """
-    env_model = os.getenv("GOOGLE_EMBEDDING_MODEL")
-    if env_model:
-        return env_model
-
-    try:
-        import google.generativeai as genai
-
-        models = genai.list_models()
-        for model in models:
-            name = getattr(model, "name", "")
-            methods = set(getattr(model, "supported_generation_methods", []) or [])
-            if "embedContent" in methods and "embedding" in name:
-                return name
-    except Exception:
-        pass
-
-    raise RuntimeError(
-        "No embedding model available. Set GOOGLE_EMBEDDING_MODEL in .env "
-        "to a model that supports embedContent."
-    )
-
-
-def get_embedding_model() -> GoogleGenerativeAIEmbeddings:
-    """Initialize Google's Gemini embedding model."""
+def get_embeddings(settings: Optional[Settings] = None) -> GoogleGenerativeAIEmbeddings:
+    """Initialise the Gemini embedding model."""
+    settings = settings or get_settings()
     return GoogleGenerativeAIEmbeddings(
-        model=_select_embedding_model(),
-        task_type="retrieval_document"
+        model=settings.embedding_model,
+        task_type="retrieval_document",
     )
 
 
-def create_vector_store(
+def split_documents(
     documents: List[Document],
-    collection_name: str = "docquery_docs"
-) -> Chroma:
-    """
-    Create a new ChromaDB vector store from documents.
-    Steps: chunk → embed → store in persistent ChromaDB.
-    """
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    embeddings = get_embedding_model()
-
-    # Split documents into overlapping chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
+    chunk_size: Optional[int] = None,
+    chunk_overlap: Optional[int] = None,
+) -> List[Document]:
+    """Split documents into overlapping chunks, preserving page metadata."""
+    settings = get_settings()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size or settings.chunk_size,
+        chunk_overlap=chunk_overlap if chunk_overlap is not None else settings.chunk_overlap,
         length_function=len,
-        separators=["\n\n", "\n", ". ", " ", ""]
+        separators=["\n\n", "\n", ". ", " ", ""],
     )
-    chunks = text_splitter.split_documents(documents)
+    return splitter.split_documents(documents)
 
-    # Create vector store with persistent storage
-    # Note: persist_directory must be a string, not Path object
+
+def build_vector_store(
+    documents: List[Document],
+    persist_dir: Optional[str | Path] = None,
+    collection_name: Optional[str] = None,
+) -> Tuple[Chroma, List[Document]]:
+    """Chunk, embed, and persist documents in ChromaDB.
+
+    Returns:
+        A tuple of ``(vector_store, chunks)`` so callers can report how many
+        chunks were indexed.
+    """
+    settings = get_settings()
+    if not documents:
+        raise ValueError("No documents to index.")
+
+    chunks = split_documents(documents)
+    if not chunks:
+        raise ValueError("No text chunks could be created from the uploaded PDFs.")
+
     vector_store = Chroma.from_documents(
         documents=chunks,
-        embedding=embeddings,
-        persist_directory=str(CHROMA_PERSIST_DIR),
-        collection_name=collection_name
+        embedding=get_embeddings(settings),
+        persist_directory=str(persist_dir or settings.persist_dir),
+        collection_name=collection_name or settings.collection_name,
     )
+    return vector_store, chunks
 
-    return vector_store
 
+def clear_vector_store(
+    persist_dir: Optional[str | Path] = None,
+    collection_name: Optional[str] = None,
+) -> None:
+    """Delete all persisted vectors so the next upload starts clean."""
+    settings = get_settings()
+    path = Path(persist_dir or settings.persist_dir)
+    collection = collection_name or settings.collection_name
 
-def get_vector_store(collection_name: str = "docquery_docs") -> Optional[Chroma]:
-    """Load an existing ChromaDB vector store from disk."""
-    embeddings = get_embedding_model()
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        return
 
+    # Best-effort collection drop first; this keeps the SQLite catalogue tidy
+    # even if a file lock prevents removing the directory in the same call.
     try:
-        return Chroma(
-            persist_directory=str(CHROMA_PERSIST_DIR),
-            embedding_function=embeddings,
-            collection_name=collection_name
-        )
-    except Exception:
-        return None
+        import chromadb
 
-
-def similarity_search(
-    vector_store: Chroma,
-    query: str,
-    k: int = TOP_K_RESULTS
-) -> List[Document]:
-    """Retrieve top-k most relevant document chunks for a query."""
-    results = vector_store.similarity_search(query, k=k)
-    return results
-
-
-def clear_vector_store() -> None:
-    """Delete all data from the vector store to start fresh."""
-    if CHROMA_PERSIST_DIR.exists():
+        client = chromadb.PersistentClient(path=str(path))
         try:
-            shutil.rmtree(CHROMA_PERSIST_DIR)
-        except OSError:
-            # Fallback in case of lingering files/locks during rapid reruns
-            shutil.rmtree(CHROMA_PERSIST_DIR, ignore_errors=True)
-        CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+            client.delete_collection(name=collection)
+        except Exception:  # noqa: BLE001 - missing collection is fine
+            pass
+    except Exception:  # noqa: BLE001 - chromadb unavailable/corrupt
+        pass
+
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
