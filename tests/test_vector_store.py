@@ -3,7 +3,12 @@ import hashlib
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
-from utils.vector_store import build_vector_store, clear_vector_store, split_documents
+from utils.vector_store import (
+    GeminiEmbeddings,
+    build_vector_store,
+    clear_vector_store,
+    split_documents,
+)
 
 
 class HashEmbeddings(Embeddings):
@@ -33,6 +38,33 @@ def test_split_documents_preserves_metadata_and_overlaps():
     assert all(chunk.metadata["source"] == "notes.pdf" for chunk in chunks)
     assert all(chunk.metadata["page"] == 4 for chunk in chunks)
     assert all(len(chunk.page_content) <= 220 for chunk in chunks)
+
+
+def test_gemini_embeddings_route_documents_and_queries_separately():
+    class RecordingEmbeddings(Embeddings):
+        def __init__(self, value):
+            self.value = value
+            self.seen = []
+
+        def embed_documents(self, texts):
+            self.seen.extend(texts)
+            return [[self.value] for _ in texts]
+
+        def embed_query(self, text):
+            self.seen.append(text)
+            return [self.value]
+
+    documents = RecordingEmbeddings(1.0)
+    queries = RecordingEmbeddings(2.0)
+
+    embeddings = GeminiEmbeddings(
+        "test-model", document_embeddings=documents, query_embeddings=queries
+    )
+
+    assert embeddings.embed_documents(["a", "b"]) == [[1.0], [1.0]]
+    assert embeddings.embed_query("q") == [2.0]
+    assert documents.seen == ["a", "b"]
+    assert queries.seen == ["q"]
 
 
 def test_build_and_clear_vector_store(tmp_path, monkeypatch):

@@ -13,19 +13,45 @@ from typing import List, Optional, Tuple
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from utils.config import Settings, get_settings
 
 
-def get_embeddings(settings: Optional[Settings] = None) -> GoogleGenerativeAIEmbeddings:
+class GeminiEmbeddings(Embeddings):
+    """Asymmetric Gemini embeddings.
+
+    Gemini optimises retrieval when documents and queries use different task
+    types. Chroma only accepts a single embedding function, so this wrapper
+    routes each call to the matching task type.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        document_embeddings: Embeddings | None = None,
+        query_embeddings: Embeddings | None = None,
+    ):
+        self._document = document_embeddings or GoogleGenerativeAIEmbeddings(
+            model=model, task_type="retrieval_document"
+        )
+        self._query = query_embeddings or GoogleGenerativeAIEmbeddings(
+            model=model, task_type="retrieval_query"
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return self._document.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._query.embed_query(text)
+
+
+def get_embeddings(settings: Settings | None = None) -> Embeddings:
     """Initialise the Gemini embedding model."""
     settings = settings or get_settings()
-    return GoogleGenerativeAIEmbeddings(
-        model=settings.embedding_model,
-        task_type="retrieval_document",
-    )
+    return GeminiEmbeddings(settings.embedding_model)
 
 
 def split_documents(

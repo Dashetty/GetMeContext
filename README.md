@@ -185,6 +185,9 @@ GetMeContext/
 - **One collection, rebuilt on upload.** Simpler than per-file collections and it
   guarantees retrieval never mixes chunks from a previous document set. The cost
   (re-embedding) is acceptable for resume-scale demos.
+- **Asymmetric embeddings.** Document chunks use Gemini's `retrieval_document`
+  task type and queries use `retrieval_query`, which improves matching without a
+  second model or index.
 - **Citations are structural, not cosmetic.** Context blocks are numbered before the
   LLM sees them, so citation markers map deterministically to UI sources.
 - **Condense only when needed.** History-aware query rewriting costs an extra LLM
