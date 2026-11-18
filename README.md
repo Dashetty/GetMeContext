@@ -162,6 +162,9 @@ The suite runs without network access or an API key: embeddings and LLM calls ar
 stubbed, while ChromaDB is exercised against a temporary directory. GitHub Actions
 runs both checks on every push.
 
+> On NTFS or network mounts where console scripts lose their executable bit, run
+> `python -m pytest` and `uvx ruff check .` instead.
+
 ## Project structure
 
 ```
